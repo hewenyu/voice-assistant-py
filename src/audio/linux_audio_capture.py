@@ -84,29 +84,35 @@ class LinuxAudioCapture:
                 self.pulse.sink_input_move(target_sink_input.index, virtual_sink.index)
                 
                 # 获取虚拟 sink 的 monitor source
-                monitor_source = virtual_sink.monitor_source_name
-                print(f"Using monitor source: {monitor_source}")
+                monitor_source = None
+                for source in self.pulse.source_list():
+                    if source.name == f"{virtual_sink_name}.monitor":
+                        monitor_source = source
+                        break
                 
-                # 创建录制流
-                self.stream = self.pulse.record_start(
-                    source=monitor_source,
-                    format='float32le',
-                    rate=44100,
-                    channels=2,
-                    stream_name='audio-capture-stream',
-                    buffer_attr=None,
-                    flags=None,
-                    volume=1.0
-                )
+                if not monitor_source:
+                    raise ValueError("Could not find monitor source")
                 
+                print(f"Using monitor source: {monitor_source.name}")
+                
+                # 设置录制回调
+                def audio_callback(ev):
+                    if not self.is_recording:
+                        raise pulsectl.PulseLoopStop
+                    
+                    if ev.is_event_type('new'):
+                        data = ev.data
+                        if data:
+                            self.process_audio(np.frombuffer(data, dtype=np.float32))
+                
+                # 开始录制
                 self.is_recording = True
                 print("Started recording application audio...")
                 
-                # 开始录制
-                while self.is_recording:
-                    data = self.stream.read()
-                    if data:
-                        self.process_audio(np.frombuffer(data, dtype=np.float32))
+                # 设置事件监听
+                self.pulse.event_mask_set('all')
+                self.pulse.event_callback_set(audio_callback)
+                self.pulse.event_listen()
                         
             finally:
                 try:
@@ -127,12 +133,6 @@ class LinuxAudioCapture:
             print(f"Error capturing audio: {e}")
             import traceback
             traceback.print_exc()
-        finally:
-            if self.stream:
-                try:
-                    self.stream.finish()
-                except:
-                    pass
 
     def stop_capture(self):
         self.is_recording = False
