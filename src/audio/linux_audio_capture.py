@@ -7,6 +7,8 @@ class LinuxAudioCapture:
         self.pulse = pulsectl.Pulse('audio-capture')
         self.stream = None
         self.is_recording = False
+        self.monitor_module = None
+        self.loopback_module = None
 
     def list_applications(self):
         print("\nListing all PulseAudio sink inputs...")
@@ -54,39 +56,34 @@ class LinuxAudioCapture:
             print(f"Name: {target_sink_input.name}")
             print(f"Application: {target_sink_input.proplist.get('application.name', '')}")
             
-            # 获取当前的 sink
-            original_sink = target_sink_input.sink
-            print(f"Original sink: {original_sink}")
+            # 获取默认输出设备
+            default_sink = self.pulse.server_info().default_sink_name
             
-            # 创建一个虚拟 sink
-            virtual_sink_name = "virtual_sink"
-            virtual_sink_id = self.pulse.module_load("module-null-sink", f"sink_name={virtual_sink_name}")
-            print(f"Created virtual sink with ID: {virtual_sink_id}")
+            # 创建一个 null sink 作为监听源
+            monitor_name = "audio_monitor"
+            self.monitor_module = self.pulse.module_load(
+                "module-null-sink",
+                f"sink_name={monitor_name}"
+            )
+            
+            print(f"Created monitor sink with ID: {self.monitor_module}")
+            
+            # 创建一个 loopback 从目标应用到监听源
+            self.loopback_module = self.pulse.module_load(
+                "module-loopback",
+                f"source={target_sink_input.sink}.monitor sink={monitor_name} latency_msec=1"
+            )
+            
+            print(f"Created loopback with ID: {self.loopback_module}")
             
             try:
-                # 等待虚拟 sink 创建完成
+                # 等待监听模块创建完成
                 time.sleep(0.5)
                 
-                # 获取所有 sinks
-                sinks = self.pulse.sink_list()
-                virtual_sink = None
-                for sink in sinks:
-                    if sink.name == virtual_sink_name:
-                        virtual_sink = sink
-                        break
-                
-                if not virtual_sink:
-                    raise ValueError("Could not find virtual sink")
-                
-                print(f"Moving sink input {target_sink_input.index} to virtual sink {virtual_sink.index}")
-                
-                # 将目标应用的音频重定向到虚拟 sink
-                self.pulse.sink_input_move(target_sink_input.index, virtual_sink.index)
-                
-                # 获取虚拟 sink 的 monitor source
+                # 获取监听源
                 monitor_source = None
                 for source in self.pulse.source_list():
-                    if source.name == f"{virtual_sink_name}.monitor":
+                    if source.name == f"{monitor_name}.monitor":
                         monitor_source = source
                         break
                 
@@ -95,54 +92,60 @@ class LinuxAudioCapture:
                 
                 print(f"Using monitor source: {monitor_source.name}")
                 
-                # 设置录制回调
+                # 设置事件回调
                 def audio_callback(ev):
                     if not self.is_recording:
                         raise pulsectl.PulseLoopStop
                     
-                    if ev.is_event_type('new'):
+                    # 检查事件类型，ev_t 是事件类型
+                    if ev.t == pulsectl.PulseEventTypeEnum.new:
                         data = ev.data
                         if data:
                             self.process_audio(np.frombuffer(data, dtype=np.float32))
                 
-                # 开始录制
+                # 设置事件监听
                 self.is_recording = True
                 print("Started recording application audio...")
                 
-                # 设置事件监听
                 self.pulse.event_mask_set('all')
                 self.pulse.event_callback_set(audio_callback)
                 self.pulse.event_listen()
                         
             finally:
-                try:
-                    # 将音频输出恢复到原始 sink
-                    if target_sink_input and original_sink:
-                        self.pulse.sink_input_move(target_sink_input.index, original_sink)
-                except Exception as e:
-                    print(f"Error restoring original sink: {e}")
-                
-                # 清理虚拟 sink
-                if virtual_sink_id:
-                    try:
-                        self.pulse.module_unload(virtual_sink_id)
-                    except Exception as e:
-                        print(f"Error unloading virtual sink: {e}")
-                    
+                self.cleanup()
         except Exception as e:
             print(f"Error capturing audio: {e}")
-            import traceback
-            traceback.print_exc()
+            self.cleanup()
 
     def stop_capture(self):
+        """停止录音并清理资源"""
+        print("Stopping audio capture...")
         self.is_recording = False
-        print("\nStopping audio capture...")
-
-    def process_audio(self, audio_data):
-        # 处理音频数据
-        # 这里可以添加你的音频处理逻辑
-        print(f"Processing audio data: shape={audio_data.shape}, max={np.max(audio_data)}, min={np.min(audio_data)}")
+        # 停止事件循环
+        self.pulse.event_listen_stop()
+        # 等待事件循环完全停止
+        time.sleep(0.5)
+        self.cleanup()
 
     def cleanup(self):
-        if self.pulse:
-            self.pulse.close()
+        """清理资源"""
+        if self.loopback_module:
+            try:
+                self.pulse.module_unload(self.loopback_module)
+                print("Unloaded loopback module")
+            except Exception as e:
+                print(f"Error unloading loopback module: {e}")
+            self.loopback_module = None
+
+        if self.monitor_module:
+            try:
+                self.pulse.module_unload(self.monitor_module)
+                print("Unloaded monitor module")
+            except Exception as e:
+                print(f"Error unloading monitor module: {e}")
+            self.monitor_module = None
+
+    def process_audio(self, audio_data):
+        """处理音频数据"""
+        # 这里可以添加你的音频处理逻辑
+        pass
